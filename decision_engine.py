@@ -51,48 +51,58 @@ def high_amount(amount: float, product_type: str, thresholds: Dict[str, Any]) ->
     t = thresholds.get(product_type, thresholds.get("_default"))
     return amount >= t
 
-def assess_row(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    score = 0
-    reasons: List[str] = []
+def check_hard_block(row: pd.Series, cfg: Dict[str, Any]) -> bool:
+    """Check if transaction should be hard blocked."""
+    chargeback_count = int(row.get("chargeback_count", 0))
+    ip_risk = str(row.get("ip_risk", "low")).lower()
+    return chargeback_count >= cfg["chargeback_hard_block"] and ip_risk == "high"
 
-    # Hard block: repeated chargebacks + high IP risk
-    if int(row.get("chargeback_count", 0)) >= cfg["chargeback_hard_block"] and str(row.get("ip_risk", "low")).lower() == "high":
-        reasons.append("hard_block:chargebacks>=2+ip_high")
-        return {"decision": DECISION_REJECTED, "risk_score": 100, "reasons": ";".join(reasons)}
-
-    # Categorical risks
-    for field, mapping in [("ip_risk", cfg["score_weights"]["ip_risk"]),
-                           ("email_risk", cfg["score_weights"]["email_risk"]),
-                           ("device_fingerprint_risk", cfg["score_weights"]["device_fingerprint_risk"])]:
+def assess_categorical_risks(row: pd.Series, cfg: Dict[str, Any], score: int, reasons: List[str]) -> int:
+    """Assess categorical risk fields and update score."""
+    risk_fields = [
+        ("ip_risk", cfg["score_weights"]["ip_risk"]),
+        ("email_risk", cfg["score_weights"]["email_risk"]),
+        ("device_fingerprint_risk", cfg["score_weights"]["device_fingerprint_risk"])
+    ]
+    for field, mapping in risk_fields:
         val = str(row.get(field, "low")).lower()
         add = mapping.get(val, 0)
         score += add
         if add:
             reasons.append(f"{field}:{val}(+{add})")
+    return score
 
-    # Reputation
+def assess_reputation(row: pd.Series, cfg: Dict[str, Any], score: int, reasons: List[str]) -> tuple:
+    """Assess user reputation and update score. Returns (score, reputation)."""
     rep = str(row.get("user_reputation", "new")).lower()
     rep_add = cfg["score_weights"]["user_reputation"].get(rep, 0)
     score += rep_add
     if rep_add:
         reasons.append(f"user_reputation:{rep}({('+' if rep_add>=0 else '')}{rep_add})")
+    return score, rep
 
+def assess_contextual_factors(row: pd.Series, cfg: Dict[str, Any], score: int, reasons: List[str]) -> int:
+    """Assess night hour and geo mismatch factors."""
     # Night hour
     hr = int(row.get("hour", 12))
     if is_night(hr):
         add = cfg["score_weights"]["night_hour"]
         score += add
         reasons.append(f"night_hour:{hr}(+{add})")
-
+    
     # Geo mismatch
     bin_c = str(row.get("bin_country", "")).upper()
-    ip_c  = str(row.get("ip_country", "")).upper()
+    ip_c = str(row.get("ip_country", "")).upper()
     if bin_c and ip_c and bin_c != ip_c:
         add = cfg["score_weights"]["geo_mismatch"]
         score += add
         reasons.append(f"geo_mismatch:{bin_c}!={ip_c}(+{add})")
+    
+    return score
 
-    # High amount for product type
+def assess_amount_and_latency(row: pd.Series, cfg: Dict[str, Any], rep: str, score: int, reasons: List[str]) -> int:
+    """Assess high amount and extreme latency factors."""
+    # High amount
     amount = float(row.get("amount_mxn", 0.0))
     ptype = str(row.get("product_type", "_default")).lower()
     if high_amount(amount, ptype, cfg["amount_thresholds"]):
@@ -103,27 +113,52 @@ def assess_row(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
             add2 = cfg["score_weights"]["new_user_high_amount"]
             score += add2
             reasons.append(f"new_user_high_amount(+{add2})")
-
+    
     # Extreme latency
     lat = int(row.get("latency_ms", 0))
     if lat >= cfg["latency_ms_extreme"]:
         add = cfg["score_weights"]["latency_extreme"]
         score += add
         reasons.append(f"latency_extreme:{lat}ms(+{add})")
+    
+    return score
 
-    # Frequency buffer for trusted/recurrent
+def apply_frequency_buffer(row: pd.Series, rep: str, score: int, reasons: List[str]) -> int:
+    """Apply frequency buffer for trusted/recurrent users."""
     freq = int(row.get("customer_txn_30d", 0))
     if rep in ("recurrent", "trusted") and freq >= 3 and score > 0:
         score -= 1
         reasons.append("frequency_buffer(-1)")
+    return score
 
-    # Decision mapping
+def map_score_to_decision(score: int, cfg: Dict[str, Any]) -> str:
+    """Map risk score to decision."""
     if score >= cfg["score_to_decision"]["reject_at"]:
-        decision = DECISION_REJECTED
+        return DECISION_REJECTED
     elif score >= cfg["score_to_decision"]["review_at"]:
-        decision = DECISION_IN_REVIEW
+        return DECISION_IN_REVIEW
     else:
-        decision = DECISION_ACCEPTED
+        return DECISION_ACCEPTED
+
+def assess_row(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Assess transaction row and return decision."""
+    score = 0
+    reasons: List[str] = []
+
+    # Hard block check
+    if check_hard_block(row, cfg):
+        reasons.append("hard_block:chargebacks>=2+ip_high")
+        return {"decision": DECISION_REJECTED, "risk_score": 100, "reasons": ";".join(reasons)}
+
+    # Assess various risk factors
+    score = assess_categorical_risks(row, cfg, score, reasons)
+    score, rep = assess_reputation(row, cfg, score, reasons)
+    score = assess_contextual_factors(row, cfg, score, reasons)
+    score = assess_amount_and_latency(row, cfg, rep, score, reasons)
+    score = apply_frequency_buffer(row, rep, score, reasons)
+
+    # Map to decision
+    decision = map_score_to_decision(score, cfg)
 
     return {"decision": decision, "risk_score": int(score), "reasons": ";".join(reasons)}
 
